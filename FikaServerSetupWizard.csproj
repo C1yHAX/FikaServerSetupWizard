@@ -6,6 +6,10 @@
     <AssemblyName>FikaServerSetupWizard</AssemblyName>
     <RootNamespace>FikaServerSetupWizard</RootNamespace>
     <Version>1.0.1</Version>
+    <FileVersion>1.0.1</FileVersion>
+    <InformationalVersion>1.0.1</InformationalVersion>
+    <!-- Otherwise the SDK appends "+<commit sha>" to the product version -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationManifest>app.manifest</ApplicationManifest>
