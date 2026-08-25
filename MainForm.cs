@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -15,6 +16,38 @@ namespace FikaServerSetupWizard
         const int HDR_H    = 56;
         const int STATUS_H = 22;
         const int LOG_H    = 200;
+
+        // Borderless window────
+        // The frame is gone, so moving and resizing are handed back to Windows
+        // via WM_NCLBUTTONDOWN. That keeps Aero snap, the resize cursors and
+        // drag-to-restore working exactly as on a normal window.
+        const int GRIP     = 6;    // thickness of the resize strips
+        const int CORNER   = 18;   // diagonal-resize zone at the strip ends
+        const int CAP_H    = 32;   // caption button height
+
+        const int WM_NCLBUTTONDOWN = 0x00A1;
+        const int WM_GETMINMAXINFO = 0x0024;
+
+        const int HTCAPTION     = 2;
+        const int HTLEFT        = 10, HTRIGHT       = 11;
+        const int HTTOP         = 12, HTTOPLEFT     = 13, HTTOPRIGHT    = 14;
+        const int HTBOTTOM      = 15, HTBOTTOMLEFT  = 16, HTBOTTOMRIGHT = 17;
+
+        [DllImport("user32.dll")]
+        static extern bool ReleaseCapture();
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        static extern IntPtr SendMessage(
+            IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MinMaxInfo
+        {
+            public Point Reserved, MaxSize, MaxPosition,
+                         MinTrackSize, MaxTrackSize;
+        }
+
+        Label? _btnMax;
 
         // State────────
         readonly AppConfig        _config = new();
@@ -56,12 +89,17 @@ namespace FikaServerSetupWizard
 
         readonly Dictionary<string, Label> _badges = new();
         readonly Dictionary<string, Panel> _panels  = new();
+
+        // Per-section status line inside each component panel
+        readonly Dictionary<string, Label> _statusBoxes = new();
+
         string _activePanelId = "Steam";
 
         // Queues
-        readonly ConcurrentQueue<(string text, string lvl)>             _logQ   = new();
-        readonly ConcurrentQueue<(string id, int state)>                _badgeQ = new();
-        readonly ConcurrentQueue<(string port, string proto, string s)> _fwQ    = new();
+        readonly ConcurrentQueue<(string text, string lvl)>             _logQ    = new();
+        readonly ConcurrentQueue<(string id, int state)>                _badgeQ  = new();
+        readonly ConcurrentQueue<(string port, string proto, string s)> _fwQ     = new();
+        readonly ConcurrentQueue<(string id, int state, string msg)>    _statusQ = new();
 
         // CONSTRUCTOR
         public MainForm()
@@ -73,6 +111,7 @@ namespace FikaServerSetupWizard
                 NotifyStatus = (id, state, msg) =>
                 {
                     _badgeQ.Enqueue((id, state));
+                    _statusQ.Enqueue((id, state, msg));
                     _logQ.Enqueue(($"[{id.ToUpper()}] {msg}",
                         state == 2 ? "O" : state == 3 ? "E" : "S"));
                 },
@@ -139,6 +178,7 @@ namespace FikaServerSetupWizard
             Font           = Theme.Bd;
             StartPosition  = FormStartPosition.CenterScreen;
             DoubleBuffered = true;
+            FormBorderStyle = FormBorderStyle.None;
 
             try
             {
@@ -149,10 +189,48 @@ namespace FikaServerSetupWizard
             catch { }
         }
 
+        // A borderless window maximises over the whole monitor, taskbar
+        // included, unless the working area is reported back to Windows.
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_GETMINMAXINFO)
+            {
+                var mmi = Marshal.PtrToStructure<MinMaxInfo>(m.LParam);
+                var scr = Screen.FromHandle(Handle);
+
+                mmi.MaxPosition = new Point(
+                    scr.WorkingArea.Left - scr.Bounds.Left,
+                    scr.WorkingArea.Top  - scr.Bounds.Top);
+                mmi.MaxSize = new Point(
+                    scr.WorkingArea.Width, scr.WorkingArea.Height);
+                mmi.MinTrackSize = new Point(
+                    MinimumSize.Width, MinimumSize.Height);
+
+                Marshal.StructureToPtr(mmi, m.LParam, false);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        // Keeps the glyph right when the state changes by other means
+        // (Win+Up, Aero snap, double-clicking the header).
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            UpdateMaxGlyph();
+        }
+
         // BUILD UI
         void BuildUI()
         {
             SuspendLayout();
+
+            // Docking is resolved in insertion order, so the resize strips have
+            // to go in before the header/status bar to end up on the outside.
+            Controls.Add(BuildGrip(DockStyle.Top));
+            Controls.Add(BuildGrip(DockStyle.Bottom));
+            Controls.Add(BuildGrip(DockStyle.Left));
+            Controls.Add(BuildGrip(DockStyle.Right));
 
             Controls.Add(BuildHeader());
             Controls.Add(BuildStatusBar());
@@ -211,6 +289,7 @@ namespace FikaServerSetupWizard
             Controls.Clear();
             _panels.Clear();
             _badges.Clear();
+            _statusBoxes.Clear();
             _fwLabels.Clear();
             _tbSptDir     = null;
             _tbApiKey     = null;
@@ -238,28 +317,170 @@ namespace FikaServerSetupWizard
             _uiTimer.Start();
         }
 
+        // BORDERLESS WINDOW  –  resize strips
+        Panel BuildGrip(DockStyle side)
+        {
+            var g = new Panel
+            {
+                Dock      = side,
+                Width     = GRIP,
+                Height    = GRIP,
+                BackColor = Theme.Bg1,
+            };
+
+            // Top and bottom strips span the full width, so they own the corners.
+            int HitAt(int x) => side switch
+            {
+                DockStyle.Left  => HTLEFT,
+                DockStyle.Right => HTRIGHT,
+                DockStyle.Top   => x < CORNER             ? HTTOPLEFT
+                                 : x > g.Width - CORNER   ? HTTOPRIGHT
+                                                          : HTTOP,
+                _               => x < CORNER             ? HTBOTTOMLEFT
+                                 : x > g.Width - CORNER   ? HTBOTTOMRIGHT
+                                                          : HTBOTTOM,
+            };
+
+            g.MouseMove += (_, e) =>
+            {
+                if (WindowState == FormWindowState.Maximized)
+                {
+                    g.Cursor = Cursors.Default;
+                    return;
+                }
+                g.Cursor = HitAt(e.X) switch
+                {
+                    HTLEFT or HTRIGHT                 => Cursors.SizeWE,
+                    HTTOP  or HTBOTTOM                => Cursors.SizeNS,
+                    HTTOPLEFT or HTBOTTOMRIGHT        => Cursors.SizeNWSE,
+                    _                                 => Cursors.SizeNESW,
+                };
+            };
+
+            g.MouseDown += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left) return;
+                if (WindowState == FormWindowState.Maximized) return;
+                ReleaseCapture();
+                SendMessage(Handle, WM_NCLBUTTONDOWN,
+                    (IntPtr)HitAt(e.X), IntPtr.Zero);
+            };
+
+            return g;
+        }
+
+        // Lets a control act as the title bar: drag to move (Windows handles
+        // snapping and drag-to-restore), double-click to toggle maximise.
+        void MakeDraggable(Control c)
+        {
+            c.MouseDown += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left) return;
+                ReleaseCapture();
+                SendMessage(Handle, WM_NCLBUTTONDOWN,
+                    (IntPtr)HTCAPTION, IntPtr.Zero);
+            };
+            c.DoubleClick += (_, _) => ToggleMaximise();
+        }
+
+        void ToggleMaximise()
+        {
+            WindowState = WindowState == FormWindowState.Maximized
+                ? FormWindowState.Normal
+                : FormWindowState.Maximized;
+            UpdateMaxGlyph();
+        }
+
+        void UpdateMaxGlyph()
+        {
+            if (_btnMax != null)
+                _btnMax.Text = WindowState == FormWindowState.Maximized
+                    ? ""   // restore
+                    : "";  // maximise
+        }
+
+        // Caption buttons – flat, themed, Windows-style glyphs.
+        Label MakeCaptionBtn(string glyph, Color hoverBg, Color hoverFg,
+            Action onClick)
+        {
+            var b = new Label
+            {
+                Text      = glyph,
+                Font      = new Font("Segoe MDL2 Assets", 8.5f),
+                ForeColor = Theme.Tx0,
+                BackColor = Theme.Bg1,
+                AutoSize  = false,
+                Size      = new Size(46, CAP_H),
+                TextAlign = ContentAlignment.MiddleCenter,
+                Cursor    = Cursors.Hand,
+            };
+            b.MouseEnter += (_, _) =>
+            {
+                b.BackColor = hoverBg;
+                b.ForeColor = hoverFg;
+            };
+            b.MouseLeave += (_, _) =>
+            {
+                b.BackColor = Theme.Bg1;
+                b.ForeColor = Theme.Tx0;
+            };
+            b.Click += (_, _) => onClick();
+            return b;
+        }
+
         // HEADER
         Panel BuildHeader()
         {
             var pnl = new Panel
                 { Dock = DockStyle.Top, Height = HDR_H, BackColor = Theme.Bg1 };
 
-            pnl.Controls.Add(new Label
+            var title = new Label
             {
                 Text      = "FIKA-SERVER SETUP UTILITY",
                 Font      = Theme.H1,
                 ForeColor = Theme.Gold,
                 AutoSize  = true,
                 Location  = new Point(16, 8),
-            });
-            pnl.Controls.Add(new Label
+            };
+            var sub = new Label
             {
                 Text      = Translations.T("h_sub"),
                 Font      = Theme.Sm,
                 ForeColor = Theme.Tx1,
                 AutoSize  = true,
                 Location  = new Point(18, 34),
-            });
+            };
+            pnl.Controls.Add(title);
+            pnl.Controls.Add(sub);
+
+            // The header replaces the removed title bar.
+            MakeDraggable(pnl);
+            MakeDraggable(title);
+            MakeDraggable(sub);
+
+            var btnClose = MakeCaptionBtn("", Theme.Red, Color.White,
+                Close);
+            _btnMax      = MakeCaptionBtn("", Theme.Bg3, Theme.GoldL,
+                ToggleMaximise);
+            var btnMin   = MakeCaptionBtn("", Theme.Bg3, Theme.GoldL,
+                () => WindowState = FormWindowState.Minimized);
+
+            pnl.Controls.Add(btnClose);
+            pnl.Controls.Add(_btnMax);
+            pnl.Controls.Add(btnMin);
+            UpdateMaxGlyph();
+
+            // Anchoring would lock in the placeholder width the panel still has
+            // at this point, so lay the buttons out whenever the header resizes.
+            void LayoutCaptionBtns()
+            {
+                btnClose.Location = new Point(pnl.Width - 46,  0);
+                _btnMax!.Location = new Point(pnl.Width - 92,  0);
+                btnMin.Location   = new Point(pnl.Width - 138, 0);
+            }
+            pnl.Resize += (_, _) => LayoutCaptionBtns();
+            LayoutCaptionBtns();
+
             pnl.Paint += (_, e) =>
             {
                 using var p = new Pen(Theme.Line);
@@ -520,6 +741,9 @@ namespace FikaServerSetupWizard
         {
             pnl.Dock    = DockStyle.Fill;
             pnl.Visible = false;
+            // The status boxes cost 60px per section – scroll rather than clip
+            // the buttons when the window is near its minimum size.
+            pnl.AutoScroll = true;
             _panels[id] = pnl;
             _contentArea.Controls.Add(pnl);
         }
@@ -545,18 +769,63 @@ namespace FikaServerSetupWizard
 
             if (!string.IsNullOrEmpty(description))
             {
+                // Fixed box rather than AutoSize: the descriptions now carry
+                // full paths and were getting clipped at the ascenders.
                 pnl.Controls.Add(new Label
                 {
-                    Text        = description,
-                    Font        = Theme.Bd,
-                    ForeColor   = Theme.Tx1,
-                    AutoSize    = true,
-                    Location    = new Point(24, 58),
-                    MaximumSize = new Size(700, 0),
+                    Text      = description,
+                    Font      = Theme.Bd,
+                    ForeColor = Theme.Tx1,
+                    AutoSize  = false,
+                    Location  = new Point(24, 56),
+                    Size      = new Size(720, 36),
+                    TextAlign = ContentAlignment.TopLeft,
                 });
             }
 
             return pnl;
+        }
+
+        // Per-section status panel – mirrors the sidebar badge, but with the
+        // full message so each section explains its own state.
+        void AddStatusBox(Panel pnl, string id, ref int y)
+        {
+            var box = new Panel
+            {
+                Location  = new Point(24, y),
+                Size      = new Size(700, 48),
+                BackColor = Theme.Bg2,
+            };
+            box.Paint += (_, e) =>
+            {
+                using var p = new Pen(Theme.Line);
+                e.Graphics.DrawRectangle(p, 0, 0, box.Width - 1, box.Height - 1);
+            };
+
+            box.Controls.Add(new Label
+            {
+                Text      = Translations.T("st_hdr"),
+                Font      = Theme.Cap,
+                ForeColor = Theme.Tx2,
+                AutoSize  = true,
+                Location  = new Point(10, 7),
+            });
+
+            var val = new Label
+            {
+                Text      = Translations.T("st_pending"),
+                Font      = Theme.Mn2,
+                ForeColor = Theme.Tx1,
+                AutoSize  = false,
+                Location  = new Point(10, 24),
+                Size      = new Size(680, 18),
+                TextAlign = ContentAlignment.TopLeft,
+            };
+            box.Controls.Add(val);
+            _statusBoxes[id] = val;
+
+            pnl.Controls.Add(box);
+            y += 60;
         }
 
         // 01 STEAM
@@ -565,6 +834,7 @@ namespace FikaServerSetupWizard
             var pnl = ContentShell("STEAM", Translations.T("st_desc"));
             int y = 100;
 
+            AddStatusBox(pnl, "Steam", ref y);
             AddInfoRow(pnl, "Standard-Pfad:",
                 @"C:\Program Files (x86)\Steam", ref y);
             y += 8;
@@ -595,6 +865,7 @@ namespace FikaServerSetupWizard
             var pnl = ContentShell("ESCAPE FROM TARKOV");
             int y = 70;
 
+            AddStatusBox(pnl, "EFT", ref y);
             AddSectionLabel(pnl, Translations.T("e_sec"), ref y);
 
             pnl.Controls.Add(new Label
@@ -693,6 +964,7 @@ namespace FikaServerSetupWizard
                 Location  = new Point(24, y),
             });
             y += 22;
+            AddStatusBox(pnl, "SPT", ref y);
             AddSectionLabel(pnl, Translations.T("sec_action"), ref y);
 
             AddLabel(pnl, "Pfad:", ref y);
@@ -758,6 +1030,7 @@ namespace FikaServerSetupWizard
                 Location  = new Point(24, y),
             });
             y += 22;
+            AddStatusBox(pnl, "Fika", ref y);
             AddSectionLabel(pnl, Translations.T("sec_action"), ref y);
 
             AddLabel(pnl, "API-Key:", ref y);
@@ -783,6 +1056,7 @@ namespace FikaServerSetupWizard
                 Translations.T("hl_desc"));
             int y = 100;
 
+            AddStatusBox(pnl, "Headless", ref y);
             AddSectionLabel(pnl, Translations.T("sec_action"), ref y);
 
             AddActionBtn(pnl, Translations.T("btn_inst_hl"), ref y, () =>
@@ -807,6 +1081,7 @@ namespace FikaServerSetupWizard
                 Location  = new Point(24, y),
             });
             y += 22;
+            AddStatusBox(pnl, "Docker", ref y);
             AddSectionLabel(pnl, Translations.T("sec_action"), ref y);
 
             AddActionBtn(pnl, Translations.T("btn_chk_docker"), ref y,
@@ -858,6 +1133,7 @@ namespace FikaServerSetupWizard
             var pnl = ContentShell("FIREWALL");
             int y = 70;
 
+            AddStatusBox(pnl, "Firewall", ref y);
             AddSectionLabel(pnl, Translations.T("fw_sec"), ref y);
 
             var ports = new[]
@@ -917,6 +1193,7 @@ namespace FikaServerSetupWizard
             var pnl = ContentShell("FIKAWEBAPP");
             int y = 70;
 
+            AddStatusBox(pnl, "WebApp", ref y);
             AddSectionLabel(pnl, Translations.T("wa_sec"), ref y);
 
             pnl.Controls.Add(new Label
@@ -1266,6 +1543,9 @@ namespace FikaServerSetupWizard
             while (_badgeQ.TryDequeue(out var b))
                 ApplyBadge(b.id, b.state);
 
+            while (_statusQ.TryDequeue(out var st))
+                ApplyStatusBox(st.id, st.state, st.msg);
+
             while (_fwQ.TryDequeue(out var fw))
             {
                 bool ok = fw.s == "v";
@@ -1302,15 +1582,25 @@ namespace FikaServerSetupWizard
         void ApplyBadge(string id, int state)
         {
             if (!_badges.TryGetValue(id, out var lbl)) return;
-            lbl.ForeColor = state switch
-            {
-                1 => Theme.Gold,
-                2 => Theme.GreenL,
-                3 => Theme.RedL,
-                4 => Theme.AmberL,
-                _ => Theme.Tx2,
-            };
+            lbl.ForeColor = StateColor(state);
         }
+
+        void ApplyStatusBox(string id, int state, string msg)
+        {
+            if (!_statusBoxes.TryGetValue(id, out var lbl)) return;
+            if (lbl.IsDisposed) return;
+            lbl.Text      = msg;
+            lbl.ForeColor = StateColor(state);
+        }
+
+        static Color StateColor(int state) => state switch
+        {
+            1 => Theme.Gold,
+            2 => Theme.GreenL,
+            3 => Theme.RedL,
+            4 => Theme.AmberL,
+            _ => Theme.Tx2,
+        };
 
         // UTILITIES
         void SafeInvoke(Action a)

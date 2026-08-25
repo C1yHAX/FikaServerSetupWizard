@@ -46,6 +46,8 @@ static class Translations
         ["h_steps"]         = new() { ["DE"] = "INSTALLATIONSSCHRITTE",                                 ["EN"] = "INSTALLATION STEPS" },
         ["h_all"]           = new() { ["DE"] = ">> ALLE INSTALLIEREN",                                  ["EN"] = ">> INSTALL ALL" },
         ["sec_action"]      = new() { ["DE"] = "AKTION",                                                ["EN"] = "ACTION" },
+        ["st_hdr"]          = new() { ["DE"] = "STATUS",                                                ["EN"] = "STATUS" },
+        ["st_pending"]      = new() { ["DE"] = "Noch nicht geprüft.",                                   ["EN"] = "Not checked yet." },
         ["st_desc"]         = new() { ["DE"] = "Lädt den offiziellen Steam Installer herunter.",        ["EN"] = "Downloads the official Steam installer." },
         ["e_sec"]           = new() { ["DE"] = "INSTALLATIONSQUELLE WAEHLEN",                           ["EN"] = "CHOOSE INSTALLATION SOURCE" },
         ["e_note"]          = new() { ["DE"] = "Steam: ...steamapps\\common\\Escape from Tarkov  /  BSG: beliebiger Pfad", ["EN"] = "Steam: ...steamapps\\common\\Escape from Tarkov  /  BSG: any path" },
