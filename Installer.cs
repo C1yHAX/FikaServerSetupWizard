@@ -24,7 +24,100 @@ static class Installer
             "User-Agent", "FikaServerSetupWizard/1.0");
     }
 
-    
+
+    //  PATH MODEL  (SPT 4.1+)
+    //
+    //  <gameRoot>\                    EscapeFromTarkov.exe, winhttp.dll
+    //    ├─ BepInEx\plugins\Fika\     client plugin  (Fika.Core.dll)
+    //    └─ SPT_Runtime\              SPT.Server.exe, SPT_Data\, user\mods\
+    //
+    //  Config.SptDir always points at the folder holding SPT.Server.exe – that is
+    //  SPT_Runtime on 4.1+, and the install root on 4.0 and earlier. Fika archives
+    //  ship paths relative to <gameRoot> and prefix server content with the runtime
+    //  folder name, so both roots are needed when extracting.
+    static readonly string[] RuntimeFolderNames = { "SPT_Runtime", "SPT" };
+
+    static string GameRoot(string? sptDir)
+    {
+        if (string.IsNullOrEmpty(sptDir)) return "";
+        var dir    = sptDir.TrimEnd(Path.DirectorySeparatorChar,
+                                    Path.AltDirectorySeparatorChar);
+        var parent = Path.GetDirectoryName(dir);
+
+        // Probe the parent for client files instead of matching on the folder
+        // name – the runtime folder can be renamed, and a 4.0-era install named
+        // "SPT" sits at the root rather than one level down.
+        if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent)
+            && (File.Exists(Path.Combine(parent, "EscapeFromTarkov.exe"))
+             || Directory.Exists(Path.Combine(parent, "BepInEx"))))
+            return parent;
+
+        return dir;
+    }
+
+    // Accepts either the game root or the runtime folder and returns whichever
+    // one actually holds SPT.Server.exe.
+    public static string? ResolveSptDir(string? candidate)
+    {
+        if (string.IsNullOrEmpty(candidate)) return null;
+        if (SptExists(candidate)) return candidate;
+
+        foreach (var rt in RuntimeFolderNames)
+        {
+            var p = Path.Combine(candidate, rt);
+            if (SptExists(p)) return p;
+        }
+        return null;
+    }
+
+    // Extracts a Fika release archive, re-rooting "SPT_Runtime\…" / "SPT\…"
+    // entries onto the detected runtime folder and everything else (BepInEx,
+    // FikaHeadlessManager.exe) onto the game root.
+    static void ExtractFikaArchive(OperationContext ctx, string zipPath)
+    {
+        var runtimeDir = ctx.Config.SptDir;
+        var gameRoot   = GameRoot(runtimeDir);
+
+        using var zip = ZipFile.OpenRead(zipPath);
+        foreach (var entry in zip.Entries)
+        {
+            var rel  = entry.FullName.Replace('/', '\\');
+            var root = gameRoot;
+
+            foreach (var rt in RuntimeFolderNames)
+            {
+                if (rel.StartsWith(rt + "\\", StringComparison.OrdinalIgnoreCase))
+                {
+                    rel  = rel[(rt.Length + 1)..];
+                    root = runtimeDir;
+                    break;
+                }
+            }
+
+            if (rel.Length == 0) continue;
+
+            var rootFull = Path.GetFullPath(root)
+                .TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var dest     = Path.GetFullPath(Path.Combine(root, rel));
+
+            if (!dest.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
+            {
+                ctx.Log($"  Skipped entry outside target: {entry.FullName}", "W");
+                continue;
+            }
+
+            if (entry.Name.Length == 0)          // directory entry
+            {
+                Directory.CreateDirectory(dest);
+                continue;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+            entry.ExtractToFile(dest, overwrite: true);
+        }
+    }
+
+
     //  CHECK ALL
     public static void OpCheckAll(OperationContext ctx)
     {
@@ -573,8 +666,14 @@ static class Installer
         ctx.NotifyStatus("SPT", 1, "Downloading SPT Installer …");
         try
         {
+            // SPT 4.x needs both runtimes present before the server will start.
+            EnsureDotnetRuntimes(ctx);
+
+            // Official installer, hosted by the SP-Tushonka project. The
+            // "latest/download" form always resolves to the newest release.
             const string url =
-                "https://ligma.waffle-lord.net/SPTInstaller.exe";
+                "https://github.com/SP-Tushonka/installer/releases/latest/" +
+                "download/SPTInstaller.exe";
             var dest = Path.Combine(Path.GetTempPath(), "SPTInstaller.exe");
             ctx.Log("Downloading SPT Installer …", "S");
             DownloadFile(ctx, url, dest);
@@ -587,7 +686,7 @@ static class Installer
             proc?.WaitForExit();
             ctx.Log("SPT Installer closed. Scanning for SPT …", "O");
 
-            var found = FindSptPath(ctx);
+            var found = ResolveSptDir(ctx.Config.SptDir) ?? FindSptPath(ctx);
             if (found != null) ctx.UpdateSptDir(found);
 
             bool ok = SptExists(ctx.Config.SptDir);
@@ -610,6 +709,9 @@ static class Installer
             if (!ValidateSptDir(ctx, "Fika")) return;
             bool anyOk = false;
 
+            ctx.Log($"Runtime folder: {ctx.Config.SptDir}", "S");
+            ctx.Log($"Game root:      {GameRoot(ctx.Config.SptDir)}", "S");
+
             foreach (var (repo, zipName) in new[]
             {
                 ("Fika-Server-CSharp", "Fika.Server.zip"),
@@ -624,11 +726,17 @@ static class Installer
 
                 var tmp = Path.Combine(Path.GetTempPath(), zipName);
                 DownloadFile(ctx, asset, tmp);
-                ZipFile.ExtractToDirectory(tmp, ctx.Config.SptDir,
-                    overwriteFiles: true);
+                ExtractFikaArchive(ctx, tmp);
                 File.Delete(tmp);
                 ctx.Log($"[OK]  {repo} installed.", "O");
                 anyOk = true;
+            }
+
+            // Only available once the server has run once and written fika.jsonc.
+            if (anyOk && string.IsNullOrWhiteSpace(ctx.Config.ApiKey))
+            {
+                var key = TryReadFikaApiKey(ctx);
+                if (key != null) ctx.UpdateApiKey(key);
             }
 
             ctx.NotifyStatus("Fika", anyOk ? 2 : 3,
@@ -662,8 +770,7 @@ static class Installer
 
                 var tmp = Path.Combine(Path.GetTempPath(), zipName);
                 DownloadFile(ctx, asset, tmp);
-                ZipFile.ExtractToDirectory(tmp, ctx.Config.SptDir,
-                    overwriteFiles: true);
+                ExtractFikaArchive(ctx, tmp);
                 File.Delete(tmp);
                 ctx.Log($"[OK]  {repo} installed.", "O");
             }
@@ -701,58 +808,162 @@ static class Installer
                   : "Some rules failed – run as Administrator.");
     }
 
+    //  FikaWebApp ships as a Docker image – the old Fika-Web SPT mod repository
+    //  no longer exists. Host port 8080 maps to the container's port 5000.
+    const string WebAppImage     = "lacyway/fikawebapp:latest";
+    const string WebAppContainer = "fikawebapp";
+
+    // Reaching the host from inside the container needs Docker Desktop's
+    // host alias – "localhost" would resolve to the container itself.
+    const string WebAppBaseUrl   = "https://host.docker.internal:6969";
+
     public static void OpWebApp(OperationContext ctx)
     {
         ctx.NotifyStatus("WebApp", 1, "Installing FikaWebApp …");
         try
         {
-            if (!ValidateSptDir(ctx, "WebApp")) return;
+            if (string.IsNullOrWhiteSpace(ctx.Config.ApiKey))
+            {
+                var key = TryReadFikaApiKey(ctx);
+                if (key != null) ctx.UpdateApiKey(key);
+            }
 
             if (string.IsNullOrWhiteSpace(ctx.Config.ApiKey))
             {
                 ctx.NotifyStatus("WebApp", 3,
                     "API key empty – enter it on the WebApp page.");
-                ctx.Log("API key required for WebApp.", "W");
+                ctx.Log("API key required for WebApp. Start the SPT server " +
+                        "once so Fika writes it to fika.jsonc.", "W");
                 return;
             }
 
-            ctx.Log("Downloading FikaWebApp …", "S");
-            var asset = GetLatestGitHubAsset(ctx,
-                "https://api.github.com/repos/project-fika/" +
-                "Fika-Web/releases/latest", ".zip");
-            if (asset == null) return;
-
-            var dest    = Path.Combine(Path.GetTempPath(), "FikaWebApp.zip");
-            var modDest = Path.Combine(
-                ctx.Config.SptDir, "user", "mods", "fika-web");
-
-            DownloadFile(ctx, asset, dest);
-
-            if (Directory.Exists(modDest))
-                Directory.Delete(modDest, recursive: true);
-
-            ZipFile.ExtractToDirectory(dest, modDest, overwriteFiles: true);
-            File.Delete(dest);
-
-            var cfgPath = Path.Combine(modDest, "config", "config.json");
-            if (File.Exists(cfgPath))
+            if (!DockerRunning())
             {
-                var txt = File.ReadAllText(cfgPath)
-                    .Replace("\"apiKey\": \"\"",
-                        $"\"apiKey\": \"{ctx.Config.ApiKey}\"")
-                    .Replace("\"apiKey\":\"\"",
-                        $"\"apiKey\":\"{ctx.Config.ApiKey}\"");
-                File.WriteAllText(cfgPath, txt);
-                ctx.Log("API key written to config.", "O");
+                ctx.NotifyStatus("WebApp", 3, "Docker is not running.");
+                ctx.Log("FikaWebApp runs as a Docker container – start " +
+                        "Docker Desktop and try again.", "W");
+                return;
             }
 
-            ctx.NotifyStatus("WebApp", 2, "FikaWebApp installed.");
-            ctx.Log("[OK]  FikaWebApp complete.", "O");
+            var dataDir = SptExists(ctx.Config.SptDir)
+                ? Path.Combine(GameRoot(ctx.Config.SptDir), "webappdata")
+                : Path.Combine(Environment.GetFolderPath(
+                    Environment.SpecialFolder.LocalApplicationData),
+                    "FikaWebApp", "data");
+            Directory.CreateDirectory(dataDir);
+
+            ctx.Log($"Pulling {WebAppImage} …", "S");
+            if (!RunDocker(ctx, $"pull {WebAppImage}", 10))
+            {
+                ctx.NotifyStatus("WebApp", 3, "Could not pull the image.");
+                return;
+            }
+
+            // Replace any previous container so a changed API key takes effect.
+            RunDocker(ctx, $"rm -f {WebAppContainer}", 1, quiet: true);
+
+            ctx.Log("Starting FikaWebApp container …", "S");
+            var args =
+                $"run -d --name {WebAppContainer} --restart unless-stopped " +
+                $"-p 8080:5000 " +
+                $"-e PORT=5000 " +
+                $"-e API_KEY={ctx.Config.ApiKey} " +
+                $"-e BASE_URL={WebAppBaseUrl} " +
+                $"-v \"{dataDir}:/app/data\" " +
+                $"{WebAppImage} --quiet-logs";
+
+            if (!RunDocker(ctx, args, 3))
+            {
+                ctx.NotifyStatus("WebApp", 3, "Container failed to start.");
+                return;
+            }
+
+            ctx.Log($"Fika server URL: {WebAppBaseUrl}", "S");
+            ctx.Log($"Data folder:     {dataDir}", "S");
+            ctx.NotifyStatus("WebApp", 2, "FikaWebApp running on port 8080.");
+            ctx.Log("[OK]  FikaWebApp running – http://localhost:8080", "O");
+            ctx.Log("      Default login: admin / Admin123!  – change it now.", "W");
         }
         catch (Exception ex)
         {
             ctx.NotifyStatus("WebApp", 3, $"Error: {ex.Message}");
             ctx.Log(ex.Message, "E");
+        }
+    }
+
+    static bool DockerRunning()
+    {
+        try
+        {
+            // --format keeps the output to a single line; "docker info" in full
+            // can outgrow the pipe buffer and stall.
+            var pi = new ProcessStartInfo("docker", "info --format {{.ServerVersion}}")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                UseShellExecute        = false,
+                CreateNoWindow         = true,
+            };
+            using var proc = Process.Start(pi);
+            if (proc == null) return false;
+
+            var stdout = proc.StandardOutput.ReadToEndAsync();
+            var stderr = proc.StandardError.ReadToEndAsync();
+            if (!proc.WaitForExit(20_000)) { try { proc.Kill(true); } catch { } return false; }
+            stdout.Wait(2_000); stderr.Wait(2_000);
+
+            return proc.ExitCode == 0;
+        }
+        catch { return false; }
+    }
+
+    static bool RunDocker(OperationContext ctx, string args,
+        int timeoutMinutes, bool quiet = false)
+    {
+        try
+        {
+            var pi = new ProcessStartInfo("docker", args)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                UseShellExecute        = false,
+                CreateNoWindow         = true,
+            };
+            using var proc = Process.Start(pi);
+            if (proc == null) return false;
+
+            // Drain both pipes concurrently – "docker pull" emits enough
+            // progress output to fill the buffer and deadlock otherwise.
+            var stdout = proc.StandardOutput.ReadToEndAsync();
+            var stderr = proc.StandardError.ReadToEndAsync();
+
+            if (!proc.WaitForExit(timeoutMinutes * 60_000))
+            {
+                try { proc.Kill(true); } catch { }
+                if (!quiet)
+                    ctx.Log($"  docker {args.Split(' ')[0]}: timed out after " +
+                            $"{timeoutMinutes} min.", "W");
+                return false;
+            }
+
+            stdout.Wait(2_000);
+            stderr.Wait(2_000);
+
+            if (proc.ExitCode == 0) return true;
+
+            if (!quiet)
+            {
+                var msg = stderr.Status == TaskStatus.RanToCompletion
+                    ? stderr.Result.Trim() : "";
+                ctx.Log($"  docker {args.Split(' ')[0]} failed " +
+                        $"({proc.ExitCode}): {msg}", "W");
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            if (!quiet) ctx.Log($"  docker error: {ex.Message}", "E");
+            return false;
         }
     }
 
@@ -763,7 +974,9 @@ static class Installer
         ctx.NotifyStatus("SPT", 1, "Checking SPT …");
         if (!SptExists(ctx.Config.SptDir))
         {
-            var found = FindSptPath(ctx);
+            // A path saved before 4.1 points at the game root – the server moved
+            // into SPT_Runtime, so try that before falling back to a full scan.
+            var found = ResolveSptDir(ctx.Config.SptDir) ?? FindSptPath(ctx);
             if (found != null) ctx.UpdateSptDir(found);
         }
         bool ok = SptExists(ctx.Config.SptDir);
@@ -786,26 +999,27 @@ static class Installer
         foreach (var drv in FixedDrives())
             foreach (var n in new[]
             {
-                "SPT","spt","SPT-AKI","spt-aki","FIKA","fika",
-                "FikaServer","fika-server",
+                "SPT","spt","SPT 4.1","SPT4","Tushonka","SPTushonka",
+                "FIKA","fika","FikaServer","fika-server",
                 @"Games\SPT", @"Games\fika", @"Spiele\SPT", @"Gaming\SPT"
             })
                 Add(Path.Combine(drv, n));
 
         foreach (var lib in GetSteamLibraries())
             foreach (var n in new[]
-                { "SPT","SPT-AKI","spt","fika","FIKA","FikaServer" })
+                { "SPT","spt","SPT 4.1","Tushonka","fika","FIKA","FikaServer" })
             {
                 Add(Path.Combine(lib, n));
                 Add(Path.Combine(lib, "steamapps", "common", n));
             }
 
+        // Each candidate may be the game root or the runtime folder itself.
         foreach (var c in seen)
         {
             try
             {
-                if (File.Exists(Path.Combine(c, "SPT.Server.exe")))
-                    return c;
+                var hit = ResolveSptDir(c);
+                if (hit != null) return hit;
             }
             catch { }
         }
@@ -826,26 +1040,18 @@ static class Installer
         ctx.NotifyStatus("Fika", 1, "Checking Fika …");
         bool serverFound = false, pluginFound = false;
 
-        foreach (var root in SptRoots(ctx.Config.SptDir))
-        {
-            if (!serverFound)
-            {
-                var m = Path.Combine(root, "user", "mods");
-                if (Directory.Exists(m))
-                    serverFound = Directory.GetDirectories(m)
-                        .Any(d => Path.GetFileName(d).StartsWith(
-                            "fika-server",
-                            StringComparison.OrdinalIgnoreCase));
-            }
-            if (!pluginFound)
-            {
-                var p = Path.Combine(root, "BepInEx", "plugins");
-                if (Directory.Exists(p))
-                    pluginFound = Directory.GetFiles(
-                        p, "Fika.Core*.dll",
-                        SearchOption.AllDirectories).Length > 0;
-            }
-        }
+        // Server mod sits next to SPT.Server.exe, the client plugin one level up
+        // at the game root (BepInEx is a sibling of SPT_Runtime on 4.1+).
+        var mods = Path.Combine(ctx.Config.SptDir ?? "", "user", "mods");
+        if (Directory.Exists(mods))
+            serverFound = Directory.GetDirectories(mods)
+                .Any(d => Path.GetFileName(d).StartsWith(
+                    "fika-server", StringComparison.OrdinalIgnoreCase));
+
+        var plugins = Path.Combine(GameRoot(ctx.Config.SptDir), "BepInEx", "plugins");
+        if (Directory.Exists(plugins))
+            pluginFound = Directory.GetFiles(plugins, "Fika.Core*.dll",
+                SearchOption.AllDirectories).Length > 0;
 
         bool ok = serverFound || pluginFound;
         ctx.NotifyStatus("Fika", ok ? 2 : 4,
@@ -861,18 +1067,13 @@ static class Installer
         ctx.NotifyStatus("Headless", 1, "Checking Headless …");
         bool found = false;
 
-        foreach (var root in SptRoots(ctx.Config.SptDir))
-        {
-            var p = Path.Combine(root, "BepInEx", "plugins");
-            if (Directory.Exists(p))
-                found |= Directory.GetFiles(p, "*headless*",
-                    SearchOption.AllDirectories).Length > 0
-                || Directory.GetFiles(p, "Fika.Headless*",
-                    SearchOption.AllDirectories).Length > 0;
+        var root = GameRoot(ctx.Config.SptDir);
+        var p    = Path.Combine(root, "BepInEx", "plugins");
+        if (Directory.Exists(p))
+            found = Directory.GetFiles(p, "Fika.Headless*",
+                SearchOption.AllDirectories).Length > 0;
 
-            found |= File.Exists(
-                Path.Combine(root, "FikaHeadlessManager.exe"));
-        }
+        found |= File.Exists(Path.Combine(root, "FikaHeadlessManager.exe"));
 
         ctx.NotifyStatus("Headless", found ? 2 : 4,
             found ? "Headless found." : "Headless not installed.");
@@ -906,12 +1107,40 @@ static class Installer
     static void CheckWebApp(OperationContext ctx)
     {
         ctx.NotifyStatus("WebApp", 1, "Checking FikaWebApp …");
-        bool ok = SptRoots(ctx.Config.SptDir).Any(r =>
-            Directory.Exists(
-                Path.Combine(r, "user", "mods", "fika-web")));
-        ctx.NotifyStatus("WebApp", ok ? 2 : 4,
-            ok ? "FikaWebApp found." : "WebApp: Not found");
-        ctx.SetBadge("WebApp", ok ? 2 : 4);
+
+        string state = "";
+        try
+        {
+            var pi = new ProcessStartInfo("docker",
+                $"ps -a --filter name=^/{WebAppContainer}$ --format {{{{.State}}}}")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                UseShellExecute        = false,
+                CreateNoWindow         = true,
+            };
+            using var proc = Process.Start(pi);
+            if (proc != null)
+            {
+                var stdout = proc.StandardOutput.ReadToEndAsync();
+                var stderr = proc.StandardError.ReadToEndAsync();
+                if (proc.WaitForExit(20_000) && stdout.Wait(2_000))
+                    state = stdout.Result.Trim();
+                else
+                    try { proc.Kill(true); } catch { }
+                stderr.Wait(2_000);
+            }
+        }
+        catch { }
+
+        bool running = state.Equals("running", StringComparison.OrdinalIgnoreCase);
+        bool present = !string.IsNullOrEmpty(state);
+
+        ctx.NotifyStatus("WebApp", running ? 2 : 4,
+            running ? "FikaWebApp container running."
+            : present ? $"FikaWebApp container present but {state}."
+                      : "WebApp: container not found");
+        ctx.SetBadge("WebApp", running ? 2 : 4);
     }
 
     
@@ -1064,20 +1293,6 @@ static class Installer
             .Where(d => d.IsReady && d.DriveType == DriveType.Fixed)
             .Select(d => d.RootDirectory.FullName);
 
-    static IEnumerable<string> SptRoots(string? sptDir)
-    {
-        if (string.IsNullOrEmpty(sptDir)) yield break;
-        yield return sptDir;
-        var p1 = Path.GetDirectoryName(sptDir);
-        if (!string.IsNullOrEmpty(p1) && Directory.Exists(p1))
-        {
-            yield return p1;
-            var p2 = Path.GetDirectoryName(p1);
-            if (!string.IsNullOrEmpty(p2) && Directory.Exists(p2))
-                yield return p2;
-        }
-    }
-
     static bool ValidateSptDir(OperationContext ctx, string id)
     {
         if (SptExists(ctx.Config.SptDir)) return true;
@@ -1128,6 +1343,109 @@ static class Installer
             ctx.Log($"  GitHub API error: {ex.Message}", "E");
         }
         return null;
+    }
+
+    //  .NET RUNTIMES  –  required by the SPT 4.x C# server and launcher
+    static readonly (string Name, string Probe, string Url)[] RequiredRuntimes =
+    {
+        ("ASP.NET Core Runtime 10", "Microsoft.AspNetCore.App 10.",
+         "https://aka.ms/dotnet/10.0/aspnetcore-runtime-win-x64.exe"),
+        (".NET Desktop Runtime 10", "Microsoft.WindowsDesktop.App 10.",
+         "https://aka.ms/dotnet/10.0/windowsdesktop-runtime-win-x64.exe"),
+    };
+
+    static string InstalledRuntimes()
+    {
+        try
+        {
+            var pi = new ProcessStartInfo("dotnet", "--list-runtimes")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                UseShellExecute        = false,
+                CreateNoWindow         = true,
+            };
+            using var proc = Process.Start(pi);
+            string output  = proc?.StandardOutput.ReadToEnd() ?? "";
+            proc?.WaitForExit();
+            return output;
+        }
+        catch { return ""; }
+    }
+
+    static void EnsureDotnetRuntimes(OperationContext ctx)
+    {
+        ctx.Log("Checking .NET runtimes required by SPT 4.x …", "S");
+        var installed = InstalledRuntimes();
+
+        foreach (var (name, probe, url) in RequiredRuntimes)
+        {
+            if (installed.Contains(probe, StringComparison.OrdinalIgnoreCase))
+            {
+                ctx.Log($"  {name}: present.", "O");
+                continue;
+            }
+
+            ctx.Log($"  {name}: missing – installing …", "W");
+            try
+            {
+                var dest = Path.Combine(Path.GetTempPath(),
+                    Path.GetFileName(new Uri(url).LocalPath));
+                DownloadFile(ctx, url, dest);
+
+                var proc = Process.Start(new ProcessStartInfo(dest,
+                    "/install /quiet /norestart")
+                {
+                    UseShellExecute = true,
+                    Verb            = "runas",
+                });
+                proc?.WaitForExit();
+
+                ctx.Log(proc?.ExitCode == 0
+                    ? $"  [OK]  {name} installed."
+                    : $"  [!!]  {name} installer returned {proc?.ExitCode}.",
+                    proc?.ExitCode == 0 ? "O" : "W");
+            }
+            catch (Exception ex)
+            {
+                ctx.Log($"  {name} install failed: {ex.Message}", "E");
+                ctx.Log($"  Install it manually from: {url}", "W");
+            }
+        }
+    }
+
+
+    //  FIKA API KEY  –  generated into fika.jsonc on the server's first start
+    static string? TryReadFikaApiKey(OperationContext ctx)
+    {
+        if (!SptExists(ctx.Config.SptDir)) return null;
+
+        var cfg = Path.Combine(ctx.Config.SptDir, "user", "mods",
+            "fika-server", "assets", "configs", "fika.jsonc");
+        if (!File.Exists(cfg))
+        {
+            ctx.Log("fika.jsonc not found – start the SPT server once to " +
+                    "generate the API key.", "W");
+            return null;
+        }
+
+        try
+        {
+            var m = Regex.Match(File.ReadAllText(cfg),
+                @"""apiKey""\s*:\s*""([^""]+)""");
+            if (!m.Success)
+            {
+                ctx.Log("fika.jsonc found but no apiKey set yet.", "W");
+                return null;
+            }
+            ctx.Log("API key read from fika.jsonc.", "O");
+            return m.Groups[1].Value;
+        }
+        catch (Exception ex)
+        {
+            ctx.Log($"Could not read fika.jsonc: {ex.Message}", "W");
+            return null;
+        }
     }
 
     static bool AddFirewallRule(OperationContext ctx,

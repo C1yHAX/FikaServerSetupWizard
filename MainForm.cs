@@ -705,22 +705,34 @@ namespace FikaServerSetupWizard
                     { Description = Translations.T("fbr_spt") };
                 if (dlg.ShowDialog() == DialogResult.OK)
                 {
-                    _config.SptDir = dlg.SelectedPath;
+                    var picked = Installer.ResolveSptDir(dlg.SelectedPath)
+                                 ?? dlg.SelectedPath;
+                    _config.SptDir = picked;
                     SafeInvoke(() =>
                     {
-                        if (_tbSptDir    != null) _tbSptDir.Text    = dlg.SelectedPath;
-                        if (_tbSetSptDir != null) _tbSetSptDir.Text = dlg.SelectedPath;
+                        if (_tbSptDir    != null) _tbSptDir.Text    = picked;
+                        if (_tbSetSptDir != null) _tbSetSptDir.Text = picked;
                     });
                 }
             });
 
             AddActionBtn(pnl, Translations.T("btn_chk_spt"), ref y, () =>
             {
-                bool ok = !string.IsNullOrEmpty(_config.SptDir)
-                       && File.Exists(
-                           Path.Combine(_config.SptDir, "SPT.Server.exe"));
+                var resolved = Installer.ResolveSptDir(_config.SptDir);
+                bool ok      = resolved != null;
+
+                if (ok && resolved != _config.SptDir)
+                {
+                    _config.SptDir = resolved!;
+                    SafeInvoke(() =>
+                    {
+                        if (_tbSptDir    != null) _tbSptDir.Text    = resolved!;
+                        if (_tbSetSptDir != null) _tbSetSptDir.Text = resolved!;
+                    });
+                }
+
                 _logQ.Enqueue((ok
-                    ? "[OK]  SPT Server found."
+                    ? $"[OK]  SPT Server found: {resolved}"
                     : "[!!]  SPT Server not found.", ok ? "O" : "W"));
                 _badgeQ.Enqueue(("SPT", ok ? 2 : 4));
             });
@@ -981,13 +993,15 @@ namespace FikaServerSetupWizard
                     { Description = Translations.T("fbr_spt") };
                 if (dlg.ShowDialog() == DialogResult.OK)
                 {
-                    _config.SptDir = dlg.SelectedPath;
+                    // Picking the game folder is the obvious mistake on 4.1+ –
+                    // step into SPT_Runtime for the user when we find it there.
+                    var picked = Installer.ResolveSptDir(dlg.SelectedPath)
+                                 ?? dlg.SelectedPath;
+                    _config.SptDir = picked;
                     SafeInvoke(() =>
                     {
-                        if (_tbSetSptDir != null)
-                            _tbSetSptDir.Text = dlg.SelectedPath;
-                        if (_tbSptDir != null)
-                            _tbSptDir.Text = dlg.SelectedPath;
+                        if (_tbSetSptDir != null) _tbSetSptDir.Text = picked;
+                        if (_tbSptDir    != null) _tbSptDir.Text    = picked;
                     });
                 }
             });
