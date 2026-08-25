@@ -749,6 +749,41 @@ static class Installer
         }
     }
 
+    //  HEADLESS CLIENT
+    //
+    //  The headless client is a SEPARATE game instance, never the player's own:
+    //  Fika.Headless sets IsHeadless unconditionally in Awake(), so dropping it
+    //  next to Fika.Core in the normal game folder turns that client headless.
+    //
+    //  Creating one means duplicating the game folder, registering a headless
+    //  profile against the running server and copying its HeadlessConfig.json
+    //  back out. That is exactly what the official Fika installer does, and it
+    //  exposes a CLI for it – so drive that instead of reimplementing it here.
+    const string FikaInstallerUrl =
+        "https://github.com/project-fika/Fika-Installer/releases/latest/" +
+        "download/Fika-Installer.exe";
+
+    public static string HeadlessDirFor(OperationContext ctx)
+    {
+        if (!string.IsNullOrWhiteSpace(ctx.Config.HeadlessDir))
+            return ctx.Config.HeadlessDir;
+
+        var gameRoot = GameRoot(ctx.Config.SptDir);
+        if (string.IsNullOrEmpty(gameRoot)) return "";
+
+        var trimmed = gameRoot.TrimEnd(Path.DirectorySeparatorChar,
+                                       Path.AltDirectorySeparatorChar);
+        var parent  = Path.GetDirectoryName(trimmed);
+        var name    = Path.GetFileName(trimmed) + " Headless";
+
+        return string.IsNullOrEmpty(parent) ? "" : Path.Combine(parent, name);
+    }
+
+    static bool HeadlessInstalled(string? dir)
+        => !string.IsNullOrEmpty(dir)
+        && File.Exists(Path.Combine(dir, "BepInEx", "plugins",
+                                    "Fika", "Fika.Headless.dll"));
+
     public static void OpHeadless(OperationContext ctx)
     {
         ctx.NotifyStatus("Headless", 1, "Installing Headless …");
@@ -756,32 +791,125 @@ static class Installer
         {
             if (!ValidateSptDir(ctx, "Headless")) return;
 
-            foreach (var (repo, zipName) in new[]
+            // The installer aborts without the server mod, so say so up front.
+            if (!Directory.Exists(Path.Combine(
+                    ctx.Config.SptDir, "user", "mods", "fika-server")))
             {
-                ("Fika-Headless",         "Fika.Headless.zip"),
-                ("Fika-Headless-Manager", "Fika.Headless.Manager.zip"),
-            })
-            {
-                ctx.Log($"Downloading {repo} …", "S");
-                var asset = GetLatestGitHubAsset(ctx,
-                    $"https://api.github.com/repos/project-fika/{repo}/releases/latest",
-                    ".zip");
-                if (asset == null) continue;
-
-                var tmp = Path.Combine(Path.GetTempPath(), zipName);
-                DownloadFile(ctx, asset, tmp);
-                ExtractFikaArchive(ctx, tmp);
-                File.Delete(tmp);
-                ctx.Log($"[OK]  {repo} installed.", "O");
+                ctx.NotifyStatus("Headless", 3,
+                    "Install Fika first – the server mod is required.");
+                ctx.Log("Fika-Server must be installed before the headless client.", "W");
+                return;
             }
 
-            ctx.NotifyStatus("Headless", 2, "Headless installed.");
+            var gameRoot    = GameRoot(ctx.Config.SptDir);
+            var headlessDir = HeadlessDirFor(ctx);
+
+            if (string.IsNullOrWhiteSpace(headlessDir))
+            {
+                ctx.NotifyStatus("Headless", 3, "No headless folder set.");
+                ctx.Log("Set a folder for the headless client first.", "W");
+                return;
+            }
+
+            if (PathsEqual(headlessDir, gameRoot))
+            {
+                ctx.NotifyStatus("Headless", 3,
+                    "Headless folder must differ from the game folder.");
+                ctx.Log("The headless client needs its own folder – installing it " +
+                        "into the game folder would turn your own client headless.", "E");
+                return;
+            }
+
+            if (HeadlessInstalled(headlessDir))
+            {
+                ctx.NotifyStatus("Headless", 2, $"Headless already installed: {headlessDir}");
+                ctx.Log("Fika Headless is already installed in that folder.", "O");
+                return;
+            }
+
+            Directory.CreateDirectory(headlessDir);
+
+            var exe = Path.Combine(headlessDir, "Fika-Installer.exe");
+            ctx.Log("Downloading the official Fika installer …", "S");
+            DownloadFile(ctx, FikaInstallerUrl, exe);
+
+            ctx.Log($"  Source instance: {gameRoot}", "S");
+            ctx.Log($"  Headless folder: {headlessDir}", "S");
+            ctx.Log("The SPT server is started and stopped once to register the " +
+                    "headless profile – this can take a minute.", "S");
+
+            int code = RunFikaInstaller(ctx, exe, headlessDir,
+                $"install headless --path \"{gameRoot}\" --method Symlink");
+
+            bool ok = code == 0 && HeadlessInstalled(headlessDir);
+
+            if (ok)
+            {
+                ctx.NotifyStatus("Headless", 2, $"Headless installed: {headlessDir}");
+                ctx.Log("[OK]  Headless client ready. Start it with " +
+                        "FikaHeadlessManager.exe in that folder.", "O");
+            }
+            else
+            {
+                ctx.NotifyStatus("Headless", 3,
+                    $"Headless install failed (exit {code}).");
+                ctx.Log($"See fika-installer.log in {headlessDir}", "W");
+            }
         }
         catch (Exception ex)
         {
             ctx.NotifyStatus("Headless", 3, $"Error: {ex.Message}");
             ctx.Log(ex.Message, "E");
         }
+    }
+
+    static bool PathsEqual(string a, string b)
+    {
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(a).TrimEnd(Path.DirectorySeparatorChar),
+                Path.GetFullPath(b).TrimEnd(Path.DirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    // Runs the Fika installer non-interactively. In CLI mode it never waits for
+    // a keypress, does not re-elevate (we are already admin) and exits 1 on the
+    // first error, so the exit code is meaningful.
+    static int RunFikaInstaller(OperationContext ctx,
+        string exe, string workDir, string args)
+    {
+        var pi = new ProcessStartInfo(exe, args)
+        {
+            WorkingDirectory       = workDir,
+            UseShellExecute        = false,
+            CreateNoWindow         = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+        };
+
+        using var proc = new Process { StartInfo = pi };
+        proc.OutputDataReceived += (_, e) =>
+            { if (!string.IsNullOrWhiteSpace(e.Data)) ctx.Log("  " + e.Data.Trim(), "S"); };
+        proc.ErrorDataReceived  += (_, e) =>
+            { if (!string.IsNullOrWhiteSpace(e.Data)) ctx.Log("  " + e.Data.Trim(), "W"); };
+
+        proc.Start();
+        proc.BeginOutputReadLine();
+        proc.BeginErrorReadLine();
+
+        // A HardCopy of the game folder can take a while; symlinking is quick
+        // but the profile step waits on the server coming up.
+        if (!proc.WaitForExit(30 * 60_000))
+        {
+            try { proc.Kill(true); } catch { }
+            ctx.Log("Fika installer timed out after 30 minutes.", "E");
+            return -1;
+        }
+
+        return proc.ExitCode;
     }
 
     public static void OpFirewall(OperationContext ctx)
@@ -1065,18 +1193,30 @@ static class Installer
     static void CheckHeadless(OperationContext ctx)
     {
         ctx.NotifyStatus("Headless", 1, "Checking Headless …");
-        bool found = false;
 
-        var root = GameRoot(ctx.Config.SptDir);
-        var p    = Path.Combine(root, "BepInEx", "plugins");
-        if (Directory.Exists(p))
-            found = Directory.GetFiles(p, "Fika.Headless*",
-                SearchOption.AllDirectories).Length > 0;
+        var headlessDir = HeadlessDirFor(ctx);
+        bool found      = HeadlessInstalled(headlessDir);
 
-        found |= File.Exists(Path.Combine(root, "FikaHeadlessManager.exe"));
+        // Fika.Headless inside the player's own instance is a broken install –
+        // earlier versions of this tool put it there. Flag it rather than
+        // reporting success.
+        var gameRoot = GameRoot(ctx.Config.SptDir);
+        bool inGameFolder = !string.IsNullOrEmpty(gameRoot)
+            && !PathsEqual(gameRoot, headlessDir)
+            && HeadlessInstalled(gameRoot);
+
+        if (inGameFolder)
+        {
+            ctx.NotifyStatus("Headless", 3,
+                "Fika.Headless sits in your game folder – that makes your own " +
+                "client headless. Remove BepInEx\\plugins\\Fika\\Fika.Headless.dll there.");
+            ctx.SetBadge("Headless", 3);
+            return;
+        }
 
         ctx.NotifyStatus("Headless", found ? 2 : 4,
-            found ? "Headless found." : "Headless not installed.");
+            found ? $"Headless found: {headlessDir}"
+                  : "Headless not installed.");
         ctx.SetBadge("Headless", found ? 2 : 4);
     }
 

@@ -5,6 +5,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>FikaServerSetupWizard</AssemblyName>
     <RootNamespace>FikaServerSetupWizard</RootNamespace>
+    <Version>1.0.1</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationManifest>app.manifest</ApplicationManifest>

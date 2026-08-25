@@ -67,6 +67,7 @@ namespace FikaServerSetupWizard
         TextBox? _tbSptDir;
         TextBox? _tbApiKey;
         TextBox? _tbWaApiKey;
+        TextBox? _tbHeadlessDir;
 
         // Settings-Panel Textboxes
         TextBox? _tbSetSptDir, _tbSetEftDir, _tbSetApiKey;
@@ -170,7 +171,7 @@ namespace FikaServerSetupWizard
         // FORM INIT
         void InitForm()
         {
-            Text           = "FIKA-SERVER SETUP UTILITY  //  v1.0";
+            Text           = "FIKA-SERVER SETUP UTILITY  //  v1.0.1";
             Size           = new Size(1440, 860);
             MinimumSize    = new Size(1024, 680);
             BackColor      = Theme.Bg0;
@@ -291,9 +292,10 @@ namespace FikaServerSetupWizard
             _badges.Clear();
             _statusBoxes.Clear();
             _fwLabels.Clear();
-            _tbSptDir     = null;
-            _tbApiKey     = null;
-            _tbWaApiKey   = null;
+            _tbSptDir      = null;
+            _tbApiKey      = null;
+            _tbWaApiKey    = null;
+            _tbHeadlessDir = null;
             _tbSetSptDir  = null;
             _tbSetEftDir  = null;
             _tbSetApiKey  = null;
@@ -1054,9 +1056,43 @@ namespace FikaServerSetupWizard
         {
             var pnl = ContentShell("HEADLESS CLIENT",
                 Translations.T("hl_desc"));
-            int y = 100;
+            int y = 96;
+
+            foreach (var key in new[] { "hl_note", "hl_note2" })
+            {
+                pnl.Controls.Add(new Label
+                {
+                    Text      = Translations.T(key),
+                    Font      = Theme.Sm,
+                    ForeColor = Theme.Amber,
+                    AutoSize  = true,
+                    Location  = new Point(24, y),
+                });
+                y += 18;
+            }
+            y += 6;
 
             AddStatusBox(pnl, "Headless", ref y);
+            AddSectionLabel(pnl, Translations.T("hl_dir_h"), ref y);
+
+            _tbHeadlessDir = AddTextBox(pnl,
+                Installer.HeadlessDirFor(_ctx), ref y);
+            _tbHeadlessDir.TextChanged += (_, _) =>
+                _config.HeadlessDir = _tbHeadlessDir.Text;
+
+            AddActionBtn(pnl, Translations.T("btn_browse"), ref y, () =>
+            {
+                using var dlg = new FolderBrowserDialog
+                    { Description = Translations.T("fbr_hl") };
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+                _config.HeadlessDir = dlg.SelectedPath;
+                SafeInvoke(() =>
+                {
+                    if (_tbHeadlessDir != null)
+                        _tbHeadlessDir.Text = dlg.SelectedPath;
+                });
+            });
+
             AddSectionLabel(pnl, Translations.T("sec_action"), ref y);
 
             AddActionBtn(pnl, Translations.T("btn_inst_hl"), ref y, () =>
